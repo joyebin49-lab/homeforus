@@ -1,5 +1,6 @@
 import { loadEnvFile } from 'node:process'
-import { writeFile, rename, rm } from 'node:fs/promises'
+import { readExcelNotices, writeNotices } from './notice-files.mjs'
+import { presetFor } from './housing-presets.mjs'
 import { fileURLToPath } from 'node:url'
 
 const root = new URL('../', import.meta.url)
@@ -34,18 +35,12 @@ async function fetchPage(page, key) {
   return result.dsList
 }
 
-const guidance = {
-  '기숙사': ['대학생·대학원생 등 신청 가능 대상과 입주 순위를 확인하세요.', '재학·입학 관련 증빙의 제출 대상과 서식을 확인하세요.'],
-  '행복주택': ['공급 계층에 청년이 포함되는지, 해당 계층의 소득·자산 요건을 확인하세요.', '해당 공급 계층의 제출서류 목록을 확인하세요.'],
-  '전세임대': ['모집 대상과 우선순위, 주택 소유 요건을 확인하세요.', '신청 순위별 자격 증빙 목록을 확인하세요.'],
-  '청년': ['공고의 청년 연령 기준과 소득·자산 요건을 확인하세요.', '청년 자격 증빙과 신청서 양식을 확인하세요.'],
-}
-
 function convert(row) {
   const title = row.PAN_NM?.trim()
   const description = [title, row.AIS_TP_CD_NM, row.UPP_AIS_TP_NM].join(' ').replace(/\s+/g, '')
-  const category = Object.keys(guidance).find(word => description.includes(word))
-  if (!category) return null
+  if (!/청년|기숙사|행복주택|전세임대/.test(description)) return null
+  if (/상가|어린이집/.test(row.AIS_TP_CD_NM)) return null
+  const preset = presetFor(row.AIS_TP_CD_NM || '', title || '')
   const link = new URL((row.DTL_URL || row.DTL_URL_MOB || '').trim())
   if (!title || !['https:', 'http:'].includes(link.protocol)) throw new Error('공고명 또는 상세 URL 누락')
   const raw = String(row.CLSG_DT ?? '').trim()
@@ -54,11 +49,10 @@ function convert(row) {
   else if (!/^\d{4}-\d{2}-\d{2}$/.test(deadline) || !Number.isFinite(Date.parse(deadline))) {
     throw new Error('마감일을 해석할 수 없습니다. 공고 ID ' + row.PAN_ID)
   }
-  const [eligibility, documents] = guidance[category]
   return {
-    공고명: title, 기관_유형: 'LH/' + (row.AIS_TP_CD_NM || row.UPP_AIS_TP_NM || category),
+    공고명: title, 기관_유형: 'LH/' + (row.AIS_TP_CD_NM || row.UPP_AIS_TP_NM || '임대주택'),
     지역: row.CNP_CD_NM || '공고문 확인', 접수마감일: deadline,
-    핵심자격_요약: eligibility, 필수준비물: documents,
+    핵심자격_요약: preset.eligibility.join('; '), 필수준비물: preset.documents.join('; '),
     임대조건_혜택: '보증금, 임대료 및 지원 한도는 공식 공고문의 공급 조건을 확인하세요.',
     세부안내_주의사항: [row.PAN_SS, row.PAN_NT_ST_DT && '게시일 ' + row.PAN_NT_ST_DT,
       '자격·서류 항목은 유형별 확인 안내입니다. 실제 신청 대상, 필수 서류와 접수 시간은 공식 공고문에서 확인하세요.'].filter(Boolean).join(' · '),
@@ -70,7 +64,8 @@ async function main() {
   if (!process.env.LH_API_KEY) loadEnvFile(fileURLToPath(new URL('.env', root)))
   const key = decodeURIComponent((process.env.LH_API_KEY || '').trim())
   if (!key) throw new Error('.env에 LH_API_KEY가 필요합니다.')
-  const notices = new Map()
+  const curated = readExcelNotices()
+  const api = []
   let received = 0, total
   for (let page = 1; ; page++) {
     const rows = await fetchPage(page, key)
@@ -80,18 +75,28 @@ async function main() {
     }
     for (const row of rows) {
       const notice = convert(row)
-      if (notice) notices.set(JSON.stringify([notice.공식신청_URL, notice.지역]), notice)
+      if (notice) api.push(notice)
     }
     received += rows.length
     if (received >= total) break
   }
-  const output = fileURLToPath(new URL('src/data/notices.json', root))
-  const temporary = output + '.' + process.pid + '.tmp'
-  try {
-    await writeFile(temporary, JSON.stringify([...notices.values()], null, 2) + '\n')
-    await rename(temporary, output)
-  } finally { await rm(temporary, { force: true }) }
-  console.log(`게시일 ${since} ~ ${today} | 수신 ${received}건 | 대상 공고 ${notices.size}건 저장`)
+  const titles = new Set(), links = new Set(), merged = []
+  for (const notice of [...curated, ...api]) {
+    const title = notice.공고명.normalize('NFC').replace(/\s+/g, '')
+    let link = ''
+    if (notice.공식신청_URL) {
+      const url = new URL(notice.공식신청_URL)
+      url.searchParams.sort()
+      link = url.href
+    }
+    const duplicate = titles.has(title) || (link && links.has(link))
+    titles.add(title)
+    if (link) links.add(link)
+    if (!duplicate) merged.push(notice)
+  }
+  await writeNotices(merged)
+  console.log(`게시일 ${since} ~ ${today} | 수신 ${received}건 | 엑셀 ${curated.length}건 + API 대상 ${api.length}건 | 중복 ${curated.length + api.length - merged.length}건 제외 | 저장 ${merged.length}건`)
+
 }
 
 main().catch(error => {
